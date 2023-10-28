@@ -27,7 +27,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lastsnapshotIndex = args.LastIncludedIndex
 	rf.lastsnapshotTerm  = args.LastIncludedTerm
 	rf.trysnapshot = true
-	DPrintf("[%v]:收到来自leader的snapshot: lastIndex:%v, [nowlogs:%v], [snapshot:%v]", rf.me, args.LastIncludedIndex, rf.log.Entries, args.Data)
+	DPrintf("[rf:%v %v]: InstallSnap, lastsnapindex:%v ", rf.me, rf.state, rf.lastsnapshotIndex)
 	rf.applyCond.Broadcast() 
 }
 
@@ -35,7 +35,6 @@ func (rf *Raft) sendSnap(peer int){
 	reply := InstallSnapshotReply{}
 	args := &InstallSnapshotArgs{rf.currentTerm, rf.me, rf.lastsnapshotIndex, rf.lastsnapshotTerm, make([]byte, len(rf.snapshot))}
 	copy(args.Data, rf.snapshot)
-	DPrintf("[%v]: sendSnap to %v: lastsnapshotIndex:%v",rf.me, peer, rf.lastsnapshotIndex)
 	ok := rf.sendSnapshot(peer, args, &reply)
 	if ok{
 		rf.mu.Lock()
@@ -69,13 +68,13 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.snapshot = make([]byte, len(snapshot))
 	copy(rf.snapshot, snapshot)
 	if index < rf.log.lastLog().Index{
+		DPrintf("[rf:%v]: receive snapshot index:%v, rf.lastlogindex:%v", rf.me, index, rf.log.lastLog().Index)
 		rf.log.cutstart(index+1)
 	}else{
 		Entries := []Entry{}
 		rf.log = mkLog(Entries,index + 1)
 	}
-	rf.persistsnapshot()
-	DPrintf("[%v]:收到来自上层的snapshot: lastIndex:%v, [nowlogs:%v], nowlog's Index0:%v", rf.me, index, rf.log.Entries, rf.log.Index0)
+	rf.persist()
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -83,23 +82,23 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	DPrintf("[rf:%v]: lastsnapshotindex:%v, rf.firstlogindex:%v, rf.commitindex:%v, rf.lastapplied:%v, snapshot:%v",
+	rf.me, lastIncludedIndex, rf.log.Index0, rf.commitIndex, rf.lastApplied, len(snapshot))
 
-	if lastIncludedIndex < rf.commitIndex || lastIncludedIndex == rf.lastApplied {
-		DPrintf("[%v]: snapshot应用失败, lastIncluedIndex:%v, lastIncludedTerm:%v, commitindex:%v", rf.me, lastIncludedIndex, lastIncludedTerm, rf.commitIndex)
+	if lastIncludedIndex < rf.commitIndex || lastIncludedIndex == rf.lastApplied || len(snapshot)==0 {
 		return false 
 	} 
 	
 	rf.lastsnapshotIndex = lastIncludedIndex
 	rf.lastsnapshotTerm = lastIncludedTerm
 	
-	if len(rf.log.Entries) != 0 && lastIncludedIndex < rf.log.lastLog().Index  {
+	if len(rf.log.Entries) != 0 && lastIncludedIndex < rf.log.lastLog().Index {
 		rf.log.cutstart(lastIncludedIndex + 1)
 	}else{
 		Entries := []Entry{}
 		rf.log = mkLog(Entries,lastIncludedIndex + 1) 
 	}
-	rf.persistsnapshot()
+	rf.persist()
 
-	DPrintf("[%v]: snapshot应用成功, lastIncluedIndex:%v, lastIncludedTerm:%v", rf.me, lastIncludedIndex, lastIncludedTerm)
 	return true
 }

@@ -52,6 +52,7 @@ func (rf *Raft) RaftPersistSize() int{
 	return rf.persister.RaftStateSize()
 }
 
+//供上层状态机调用，获取当前peer的状态
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -96,10 +97,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
+//供上层状态机调用，向当前peer尝试发送一条command
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	//若peer不是leader，发送失败，直接返回
 	if rf.state != Leader {
 		return -1, rf.currentTerm, false
 	}
@@ -107,23 +110,26 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := rf.lastLogIndex() + 1
 	e := Entry{command, rf.currentTerm, index}
 
+	//将command添加到日志中
 	rf.log.appendone(e)
 	rf.persist()
-	DPrintf("[%v]: term %v Start %v", rf.me, rf.currentTerm, e)
+	
+	//收到command后，立刻发送一轮追加日志，加快日志的同步
 	rf.sendAppendsL(false)
 
 	return index, rf.currentTerm, true
 }
 
+//如果接收到的 RPC 请求或响应中，任期号T > currentTerm
+//则令 currentTerm = T，并切换为跟随者状态
 func (rf *Raft) setNewTerm(term int) {
 	rf.state = Follower
 	rf.currentTerm = term
 	rf.votedFor = -1
 	rf.persist()
-	DPrintf("[%d]: set term %v\n", rf.me, rf.currentTerm)
 }
 
-
+//重置选举超时时间：350~700ms
 func (rf *Raft) resetElectionTimer() {
 	t := time.Now()
 	t = t.Add(350 * time.Millisecond)
@@ -132,20 +138,23 @@ func (rf *Raft) resetElectionTimer() {
 	rf.electionTime = t
 }
 
+//心跳时间：100ms
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		rf.check()
-		DPrintf("[%v]: wake up", rf.me)
-		ms := 50
+		ms := 100
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
+//检查当前peer状态
 func (rf *Raft) check() {
 	rf.mu.Lock()
 	if rf.state == Leader {
+		//peer为leader，发送一轮心跳包
 		rf.sendAppendsL(true)
 	}else if time.Now().After(rf.electionTime) {
+		//peer达到选举超时时间，重新开始一轮选举
 		rf.startElectionL()
 	}
 	rf.mu.Unlock()
@@ -186,7 +195,6 @@ func (rf *Raft) updateCommitIndexL() {
 		}
 		if counter > len(rf.peers)/2 {
 			rf.commitIndex = n
-			DPrintf("[%v] leader尝试提交 index %v", rf.me, rf.commitIndex)
 			rf.applyCond.Broadcast()
 		}
 	}
@@ -214,11 +222,11 @@ func (rf *Raft) applier() {
 			rf.mu.Unlock()
 			rf.applyCh <- applyMsg
 			rf.mu.Lock()
-			DPrintf("[%v]: rf.applysnapshot success", rf.me) 
+			DPrintf("[rf:%v %v]: rf.applysnapshot success: lastsnapshotindex:%v, snapshot:%v", rf.me, rf.state, rf.lastsnapshotIndex, len(rf.snapshot)) 
 		} else if len(rf.log.Entries)!=0 && rf.commitIndex > rf.lastApplied && rf.log.lastLog().Index > rf.lastApplied {
 			rf.lastApplied++
 			if rf.lastApplied >= rf.log.Index0 {
-				DPrintf("[%v]: try to apply lastapplied:%v", rf.me, rf.lastApplied)
+				DPrintf("[rf:%v %v]: try to apply lastapplied:%v", rf.me, rf.state, rf.lastApplied)
 				applyMsg := ApplyMsg{
 					CommandValid: true,
 					Command:      rf.log.at(rf.lastApplied).Command,
@@ -228,11 +236,10 @@ func (rf *Raft) applier() {
 				rf.mu.Unlock()
 				rf.applyCh <- applyMsg
 				rf.mu.Lock()
-				DPrintf("[%v]: rf.apply success", rf.me)
+				DPrintf("[rf:%v %v]: rf.apply success", rf.me, rf.state)
 			}
 		} else {
 			rf.applyCond.Wait()
-			DPrintf("[%v]: rf.applyCond.Wait()", rf.me)
 		}
 	}
 }

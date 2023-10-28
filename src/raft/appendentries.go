@@ -18,25 +18,26 @@ type AppendEntriesReply struct {
 	XLen     int
 }
 
+//follower处理leader发送的Append RPC请求
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("[%d]: term:%v receive AE from:%v(term:%v, previndex:%v, prevterm:%v),  ",
-	 rf.me, rf.currentTerm, args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm)
+
 	reply.Term = rf.currentTerm
 	reply.Success = false
 	reply.Conflict = false
 
+	//当follower任期比leader高，则返回false
 	if args.Term < rf.currentTerm {
 		return
 	}
+
+	//重置选举超时时间
 	rf.resetElectionTimer()
 
+	//修改follower的任期 以及 状态
 	if args.Term > rf.currentTerm {
 		rf.setNewTerm(args.Term)
-	}
-	if rf.state == Candidate {
-		rf.state = Follower
 	}
 
 	if len(rf.log.Entries) != 0{
@@ -50,8 +51,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.XTerm = -1
 			reply.XIndex = -1
 			reply.XLen = rf.log.len()
-			DPrintf("[%v]: Conflict XTerm %v, XIndex %v, XLen %v", rf.me, reply.XTerm, reply.XIndex, reply.XLen)
-			DPrintf("[%v]: LastLogIndex = %v, LogLen = %v", rf.me, rf.lastLogIndex(), rf.log.len())
 			return
 		}
 	
@@ -66,7 +65,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			reply.XTerm = xTerm
 			reply.XLen = rf.log.len()
-			DPrintf("[%v]: Conflict XTerm %v, XIndex %v, XLen %v", rf.me, reply.XTerm, reply.XIndex, reply.XLen)
 			return
 		}
 
@@ -79,7 +77,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			if entry.Index > rf.lastLogIndex() {
 				rf.log.append(args.Entries[idx:]...)
-				DPrintf("[%d]: follower append [%v]", rf.me, args.Entries[idx:])
 				rf.persist()
 				break
 			}
@@ -93,7 +90,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				continue 
 			}
 			rf.log.append(args.Entries[idx:]...)
-			DPrintf("[%d]: follower append [%v]", rf.me, args.Entries[idx:])
 			rf.persist()
 			break
 		}
@@ -101,7 +97,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, rf.lastLogIndex())
-		DPrintf("[%v]: now commitIndex: %v", rf.me, rf.commitIndex)
 		rf.applyCond.Broadcast()
 	}
 	reply.Success = true
@@ -112,7 +107,6 @@ func (rf *Raft) sendAppendsL(heartbeat bool) {
 		if peer != rf.me {
 			if heartbeat || (len(rf.log.Entries)!=0 && rf.lastLogIndex() >= rf.nextIndex[peer]) {
 				rf.sendAppendL(peer, heartbeat)
-				DPrintf("[%v]: send to %v AE | heartbeat", rf.me, peer)
 			}
 		}
 	}
@@ -179,9 +173,7 @@ func (rf *Raft) pocessAppendReplyL(serverId int, args *AppendEntriesArgs, reply 
 			next := match + 1
 			rf.nextIndex[serverId] = max(rf.nextIndex[serverId], next)
 			rf.matchIndex[serverId] = max(rf.matchIndex[serverId], match)
-			DPrintf("[%v]: %v append success next %v match %v", rf.me, serverId, rf.nextIndex[serverId], rf.matchIndex[serverId])
 		}else if reply.Conflict {
-			DPrintf("[%v]: Conflict from %v %#v", rf.me, serverId, reply)
 			if reply.XTerm == -1 {
 				rf.nextIndex[serverId] = reply.XLen
 			} else {
@@ -193,7 +185,6 @@ func (rf *Raft) pocessAppendReplyL(serverId int, args *AppendEntriesArgs, reply 
 					rf.nextIndex[serverId] = reply.XIndex
 				}
 			}
-			DPrintf("[%v]: leader nextIndex[%v] %v", rf.me, serverId, rf.nextIndex[serverId])
 			if rf.nextIndex[serverId] < rf.log.Index0{
 				go rf.sendSnap(serverId)
 				rf.nextIndex[serverId] = rf.log.Index0

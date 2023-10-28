@@ -1,10 +1,5 @@
 package raft
 
-import(
-	"fmt"
-	"strings"
-)
-
 type Log struct {
 	Entries []Entry
 	Index0  int
@@ -15,7 +10,6 @@ type Entry struct {
 	Term    int
 	Index   int
 }
-
 
 func makeEmptyLog() Log {
 	log := Log{
@@ -59,18 +53,6 @@ func (rf *Raft) lastLogTerm() int {
 	}else {
 		return rf.log.lastLog().Term
 	}
-}
-
-func (e *Entry) String() string {
-	return fmt.Sprint(e.Term)
-}
-
-func (l *Log) String() string {
-	nums := []string{}
-	for _, entry := range l.Entries {
-		nums = append(nums, fmt.Sprintf("%4d", entry.Term))
-	}
-	return fmt.Sprint(strings.Join(nums, "|"))
 }
 
 func mkLog(log []Entry, index0 int) Log {
