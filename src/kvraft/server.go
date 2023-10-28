@@ -11,16 +11,16 @@ import (
 )
 
 type Op struct{
-	SeqId int
-	ClientId int64
-	Key string
-	Value string
-	OpType OPType
+	SeqId int						//记录本次command的序号值
+	ClientId int64					//记录发送本次command的clientID
+	Key string						//记录本次command的key值
+	Value string					//记录本次comman的value值
+	OpType OPType					//记录本次command的类型
 }
  
 type ResultMsg struct{
-	MsgFromRaft raft.ApplyMsg
-	ResultStr   string
+	MsgFromRaft raft.ApplyMsg		//记录raft层apply的消息
+	ResultStr   string				//记录本次command需要返回给client的结果
 }
 
 type KVServer struct {
@@ -29,14 +29,13 @@ type KVServer struct {
 	rf      *raft.Raft
 	persister *raft.Persister
 	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
+	dead    int32
 
-	maxraftstate int // snapshot if log grows this big
-	kvmap map[string]string 
-	kvlastop map[int64]Op
-	kvchan map[int]chan ResultMsg
-	lastIncludeIndex int
-	lastApplied int
+	maxraftstate int				//定义允许的raft层持久化状态最大值，超过此值需要裁减raft层日志，进行快照
+	kvmap map[string]string 		//用于server层的kv存储
+	kvlastop map[int64]Op			//用于记录各client发来的command历史，防止重复执行command
+	kvchan map[int]chan ResultMsg	//用于Applyroute线程正确返回消息
+	lastApplied int					
 	lastSnapshot int
 }
 
@@ -44,7 +43,6 @@ type KVServer struct {
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
 }
 
 func (kv *KVServer) killed() bool {
@@ -54,15 +52,11 @@ func (kv *KVServer) killed() bool {
 
 
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
-	// call labgob.Register on structures you want
-	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
-
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
-	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -70,7 +64,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.kvlastop = make(map[int64]Op)
 	kv.kvchan = make(map[int]chan ResultMsg)
 
-	kv.lastIncludeIndex = 0
 	kv.lastApplied = 0
 	kv.lastSnapshot = 0
 	kv.persister = persister
@@ -92,12 +85,14 @@ func(kv *KVServer) Applyroute(){
 
 		resStr := ""
 		if applyMsg.CommandValid{
-		kv.mu.Lock()
-		kv.lastApplied = applyMsg.CommandIndex
+			kv.mu.Lock()
+			kv.lastApplied = applyMsg.CommandIndex
 			op := applyMsg.Command.(Op)
 
+			//通过kvlastop检测该client发送的command是否已经被执行过
 			if lastOp, ok := kv.kvlastop[op.ClientId]; !ok || lastOp.SeqId != op.SeqId{
 				DPrintf("[server:%v]: not duplicate OP, do the OP:%v\n", kv.me, op.OpType)
+				//若未执行，则执行相关的command命令
 				switch op.OpType {
 				case OpGet:
 					resStr = kv.kvmap[op.Key]
@@ -109,13 +104,14 @@ func(kv *KVServer) Applyroute(){
 
 				}
 				kv.kvlastop[op.ClientId] = op
+			//若已经执行过该command，且如果该command是OpGet操作，则返回value值
 			}else if ok && lastOp.SeqId == op.SeqId && op.OpType == OpGet{
 				DPrintf("[server:%v]: duplicate Get oP, return pre result \n", kv.me)
 				resStr = kv.kvmap[op.Key]
 			}
 			
+			//取出该commandIndex相关联的通道，传入applyMsg和resstr结果字符串
 			if curCh, ok := kv.kvchan[applyMsg.CommandIndex]; ok{
-				DPrintf("[server:%v]: return chan result: %v, resultstr: %v \n", kv.me, applyMsg, resStr)
 				curCh <- ResultMsg{MsgFromRaft:applyMsg, ResultStr: resStr}
 				delete(kv.kvchan, applyMsg.CommandIndex - 1)
 			}
@@ -123,13 +119,14 @@ func(kv *KVServer) Applyroute(){
 		}
 		if applyMsg.SnapshotValid{
 			kv.mu.Lock()
+			//调用raft层的CondInstallSnapshot()，判断当前的snapshot文件是否可以安装
 			if kv.rf.CondInstallSnapshot(applyMsg.SnapshotTerm, applyMsg.SnapshotIndex, applyMsg.Snapshot) {
-				kv.setSnapshot(applyMsg.Snapshot)
-				kv.lastApplied = applyMsg.SnapshotIndex
+				kv.setSnapshot(applyMsg.Snapshot)						//安装snapshot
+				kv.lastApplied = applyMsg.SnapshotIndex					//更新lastapplied值
+			}
+			kv.mu.Unlock()
+		}
 	}
-	kv.mu.Unlock()
-}
-}
 }
 
 
@@ -147,38 +144,42 @@ func(kv *KVServer) Command(args *CmdArgs, reply *CmdReply){
 		Value : args.Value,
 		OpType : args.OpType,
 	}
+
+	//调用raft层的Start()，尝试将command发送给该server关联的raft peer
 	if cur_index, cur_term, is_leader = kv.rf.Start(op); !is_leader{
 		DPrintf("[server:%v]: is not leader \n", kv.me)
-		reply.Err = ErrWrongLeader
-	return
+		reply.Err = ErrWrongLeader									//如果关联的raft peer不是leader，则返回rpc请求错误
+		return
 	}
 
+	//如果已经有相同commandIndex的通道存在，则让它失效（发送一个fail_msg让它接收)
 	if pre_ch, ok := kv.kvchan[cur_index]; ok{
 		fail_msg := raft.ApplyMsg{CommandValid: false, SnapshotValid: false}
 		pre_ch <- ResultMsg{MsgFromRaft: fail_msg}
 		DPrintf("[server:%v]:重复的index请求 \n", kv.me)
 	}
+
 	kv.kvchan[cur_index] = make(chan ResultMsg)
 	cur_ch := kv.kvchan[cur_index]
 
-		kv.mu.Unlock()
-		DPrintf("[server:%v]: wait chan result\n", kv.me)
+	kv.mu.Unlock()
+	result_msg := <- cur_ch
+	kv.mu.Lock()
 
-		result_msg := <- cur_ch
-
-		kv.mu.Lock()
-		if result_msg.MsgFromRaft.CommandValid {
+	if result_msg.MsgFromRaft.CommandValid {
+		//取出该raft applMsg的command内容
 		cur_op := result_msg.MsgFromRaft.Command.(Op)
+		//检测该command是否与rpc请求的command对应
 		if result_msg.MsgFromRaft.CommandTerm == cur_term && cur_op.ClientId == args.ClientId{
 			reply.Err = OK
-		reply.Value = result_msg.ResultStr
+			reply.Value = result_msg.ResultStr
 			DPrintf("[server:%v]: return OK, value: %v \n", kv.me, reply.Value)
 			return
 		}else{
 			DPrintf("[server:%v]: term change: is not leader \n", kv.me)
 			reply.Err = ErrWrongLeader
 		}
-		}else{
+	}else{
 		reply.Err = ErrNotCommand
 	}
 }
@@ -186,8 +187,8 @@ func(kv *KVServer) Command(args *CmdArgs, reply *CmdReply){
 func (kv *KVServer) snapshoter() {
 	for !kv.killed() {
 		kv.mu.Lock()
-		DPrintf("111")
         if kv.isNeedSnapshot() && kv.lastApplied > kv.lastSnapshot {
+			//若raft持久化状态过大，且有未被快照的日志，就进行快照
             kv.doSnapshot(kv.lastApplied)
             kv.lastSnapshot = kv.lastApplied
 		}
@@ -196,6 +197,7 @@ func (kv *KVServer) snapshoter() {
     }
 }
 
+//检测当前是否需要进行snapshot
 func (kv *KVServer) isNeedSnapshot() bool {
     if kv.maxraftstate != -1 && kv.rf.RaftPersistSize() > kv.maxraftstate {
         return true

@@ -4,8 +4,8 @@ const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
-ErrNotCommand  = "ErrNotCommand"
-	)
+	ErrNotCommand  = "ErrNotCommand"
+)
 
 const (
 	OpGet          = "OpGet"
@@ -19,7 +19,7 @@ type OPType string
 type CmdReply struct {
 	Err   Err
 	Value string
-ServerId int
+	ServerId int
 }
 
 type CmdArgs struct{
