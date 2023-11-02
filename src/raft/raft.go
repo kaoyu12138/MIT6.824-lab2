@@ -173,7 +173,9 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+//用于在leader append成功时检查是否能更新commitIndex的值
 func (rf *Raft) updateCommitIndexL() {
+	//如果不是leader 或 当前日志为空则退出
 	if rf.state != Leader || len(rf.log.Entries) == 0 {
 		return
 	}
@@ -183,16 +185,19 @@ func (rf *Raft) updateCommitIndexL() {
 		start = rf.log.Index0
 	}
 
-	for n := start ; n <= rf.log.lastLog().Index; n++ {
+	for n := start ; n <= rf.lastLogIndex(); n++ {
+		//每次commit都只能提交自己当前任期的日志，故不是当前任期则continue
 		if rf.log.at(n).Term != rf.currentTerm {
 			continue
 		}
 		counter := 1
+		//遍历其他raft peers，检查该日志是否在这些peer上
 		for serverId := 0; serverId < len(rf.peers); serverId++ {
 			if serverId != rf.me && rf.matchIndex[serverId] >= n {
 				counter++
 			}
 		}
+		//如果发现该日志存在于大部分peers的日志中，则更新commitIndex，并唤醒applier线程
 		if counter > len(rf.peers)/2 {
 			rf.commitIndex = n
 			rf.applyCond.Broadcast()
@@ -200,6 +205,7 @@ func (rf *Raft) updateCommitIndexL() {
 	}
 }
 
+//等待唤醒，并进行快照或日志的apply
 func (rf *Raft) applier() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -223,7 +229,7 @@ func (rf *Raft) applier() {
 			rf.applyCh <- applyMsg
 			rf.mu.Lock()
 			DPrintf("[rf:%v %v]: rf.applysnapshot success: lastsnapshotindex:%v, snapshot:%v", rf.me, rf.state, rf.lastsnapshotIndex, len(rf.snapshot)) 
-		} else if len(rf.log.Entries)!=0 && rf.commitIndex > rf.lastApplied && rf.log.lastLog().Index > rf.lastApplied {
+		} else if len(rf.log.Entries)!=0 && rf.commitIndex > rf.lastApplied && rf.lastLogIndex() > rf.lastApplied {
 			rf.lastApplied++
 			if rf.lastApplied >= rf.log.Index0 {
 				DPrintf("[rf:%v %v]: try to apply lastapplied:%v", rf.me, rf.state, rf.lastApplied)
@@ -234,11 +240,13 @@ func (rf *Raft) applier() {
 					CommandTerm: rf.currentTerm,
 				}
 				rf.mu.Unlock()
+				//将applyMsg放入通道时先解锁，防止死锁阻塞
 				rf.applyCh <- applyMsg
 				rf.mu.Lock()
 				DPrintf("[rf:%v %v]: rf.apply success", rf.me, rf.state)
 			}
 		} else {
+			//applier线程在此处等待被唤醒
 			rf.applyCond.Wait()
 		}
 	}

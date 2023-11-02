@@ -35,12 +35,14 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor = votedFor
 		rf.currentTerm = currentTerm
 		rf.log = logs
+		rf.lastsnapshotIndex = lastsnapshotIndex
+		rf.lastsnapshotTerm = lastsnapshotTerm
+		DPrintf("[rf:%v %v]:restart firstlogindex:%v, lastsnapshotindex:%v", rf.me, rf.state, rf.log.Index0, rf.lastsnapshotIndex)
 	
 		SnapshotData := rf.persister.ReadSnapshot()
 		if len(SnapshotData) > 0 {
 			rf.snapshot = SnapshotData
-			rf.lastsnapshotIndex = lastsnapshotIndex
-			rf.lastsnapshotTerm = lastsnapshotTerm
+			//当commitindex小于lastsnapshotindex，马上更新commitindex，并尝试能否apply新日志
 			if rf.commitIndex < lastsnapshotIndex{
 				rf.commitIndex = lastsnapshotIndex
 				rf.applyCond.Broadcast()

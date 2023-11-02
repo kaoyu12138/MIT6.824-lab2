@@ -12,15 +12,21 @@ type InstallSnapshotReply struct{
 	Term int
 }
 
+//follower接收来自leader发送过来的snapshot
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	reply.Term = rf.currentTerm
+	//如果leader任期比follower小，或leader的snapshot比follower的旧，则return
 	if args.Term < rf.currentTerm{
 		return 
 	}
+	if args.LastIncludedIndex < rf.lastsnapshotIndex{
+		return 
+	}
 
+	//否则无条件接收来自leader的snapshot
 	rf.snapshot = make([]byte, len(args.Data))
 	copy(rf.snapshot, args.Data)
 
@@ -28,6 +34,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lastsnapshotTerm  = args.LastIncludedTerm
 	rf.trysnapshot = true
 	DPrintf("[rf:%v %v]: InstallSnap, lastsnapindex:%v ", rf.me, rf.state, rf.lastsnapshotIndex)
+
+	rf.persist()
 	rf.applyCond.Broadcast() 
 }
 
@@ -54,22 +62,25 @@ func (rf *Raft) pocessSnapshotReplyL(serverId int, args *InstallSnapshotArgs, re
 	}
 }
 
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
+//供上层kvserver调用，主动进行日志的快照
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	if rf.log.Index0 > index{
+		return 
+	}
 	rf.lastsnapshotIndex = index
 	rf.lastsnapshotTerm = rf.log.at(index).Term
 
 	rf.snapshot = make([]byte, len(snapshot))
 	copy(rf.snapshot, snapshot)
+
+	//如果该snapshot包含的最后一条日志的索引，小于当前日志的最后一条日志的索引，则进行日志裁剪
 	if index < rf.log.lastLog().Index{
 		DPrintf("[rf:%v]: receive snapshot index:%v, rf.lastlogindex:%v", rf.me, index, rf.log.lastLog().Index)
 		rf.log.cutstart(index+1)
+	//否则将日志全部丢弃，创建新的空日志
 	}else{
 		Entries := []Entry{}
 		rf.log = mkLog(Entries,index + 1)
@@ -77,15 +88,13 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.persist()
 }
 
-// A service wants to switch to snapshot.  Only do so if Raft hasn't
-// have more recent info since it communicate the snapshot on applyCh.
+//供上层kvserver调用，判断是否可以安装快照
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("[rf:%v]: lastsnapshotindex:%v, rf.firstlogindex:%v, rf.commitindex:%v, rf.lastapplied:%v, snapshot:%v",
-	rf.me, lastIncludedIndex, rf.log.Index0, rf.commitIndex, rf.lastApplied, len(snapshot))
 
-	if lastIncludedIndex < rf.commitIndex || lastIncludedIndex == rf.lastApplied || len(snapshot)==0 {
+	//如果快照最后一条日志小于commitindex或等于lastapplied说明可能已经有新的日志在apply或已经apply了，旧快照不能安装
+	if lastIncludedIndex < rf.commitIndex || lastIncludedIndex == rf.lastApplied || len(snapshot)==0 || lastIncludedIndex < rf.log.Index0 {
 		return false 
 	} 
 	

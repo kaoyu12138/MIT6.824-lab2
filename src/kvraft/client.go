@@ -1,163 +1,176 @@
 package kvraft
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
-import "time"
-import "sync"
-
-const (
-	RPCWait = "RPCWait"         //等待RPC回复状态
-	RPCWithRes = "RPCWithRes"   //带有返回结果的RPC状态
-	RPCNoRes = "RPCNoRes"       //不带有返回结果的RPC状态
-	RPCWrong = "RPCWrong"		//RPC出错状态
+import (
+	"6.824/labrpc"
+	"sync"
+	"time"
 )
 
-type Clerk struct {
-	servers []*labrpc.ClientEnd
-	mu sync.Mutex
-
-	rpcstate string 			//记录rpc请求的完成状态
-	rpcres string				//记录rpc请求的结果
-	rpcnum int					//记录rpc的序号值，方便正确接收rpc回复
-
-	clerkId int64				//记录该client的ID
-	seqId int					//记录command的序号值，防止重复执行命令
-	leaderId int				//记录当前leaderID
+type task struct {
+	index    RequestId   // 对于当前Client的任务的Index
+	op       string      // 任务类型
+	key      string      // Get/PutAppend参数
+	value    string      // PutAppend参数
+	resultCh chan string // 传Get的返回值和Block住Get/PutAppend方法
 }
 
-//负责生成随机值，作为clerkID
-func nrand() int64 {
-	max := big.NewInt(int64(1) << 62)
-	bigx, _ := rand.Int(rand.Reader, max)
-	x := bigx.Int64()
-	return x
+type Clerk struct {
+	servers     []*labrpc.ClientEnd
+	taskMu      sync.Mutex
+	taskQueue   chan task // 任务队列
+	clientTag   ClientId  // Client的唯一标识
+	taskIndex   RequestId // 最后一条任务的下标(包括未完成的任务)
+	leaderIndex int       // 上一次成功完成任务的Leader的Index,没有的话为-1
 }
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
-	ck := new(Clerk)
-	ck.servers = servers
-	ck.clerkId = nrand()
-	ck.seqId = 0
-	ck.leaderId = 0
-	ck.rpcnum = 0
-
+	ck := &Clerk{
+		servers:     servers,
+		taskQueue:   make(chan task),
+		clientTag:   nRand(),
+		leaderIndex: -1,
+	}
+	go ck.doTasks()
 	return ck
 }
 
-func (ck *Clerk) sendCmd(key string, value string, OpType OPType) (string, bool) {
-	for i,j := ck.leaderId, 0; j < len(ck.servers) ; j ++ {
-		ck.mu.Lock()
-		cur_server := (i + j)%len(ck.servers)
-
-		ck.rpcnum += 1
-		ck.rpcstate = RPCWait
-		DPrintf("[clerk:%v]: ckrpcnum:%v, ckrpcstate:%v, sendto:%v\n", ck.clerkId, ck.rpcnum, ck.rpcstate, cur_server)
-
-		ck.mu.Unlock()
-		go ck.sendCmdRpc(cur_server, ck.rpcnum, key, value, OpType)
-	
-		//在client端实现超时机制，rpc请求发向一个server后会在for循环中等待60*10ms
-		for t := 1; t <= 60; t ++ {
-			ck.mu.Lock()
-			//rpc返回预期结果
-			if ck.rpcstate == RPCWithRes || ck.rpcstate == RPCNoRes{
-				ck.seqId ++									//当前发送的command已经完成，递增seqId
-				ck.leaderId = cur_server					//更新当前的leaderID
-				DPrintf("[clerk:%v]: return result:%v\n",ck.clerkId, ck.rpcres)
-				ck.mu.Unlock()								
-				return ck.rpcres,true						//返回结果
-			}else if ck.rpcstate == RPCWrong{
-				DPrintf("[clerk:%v]: return wrong rpc\n", ck.clerkId)
-				ck.mu.Unlock()
-				break										//rpc请求发生错误，则跳出循环，尝试发送给下一个server
+// 持续通过ck.taskQueue接受新的任务
+func (ck *Clerk) doTasks() {
+	for {
+		currentTask := <-ck.taskQueue
+		DPrintf("C[%v] start a task:[%v]\n", ck.clientTag, currentTask)
+		var args interface{}
+		// 根据任务类型设置args
+		if currentTask.op == "Get" {
+			// Get task
+			args = &GetArgs{
+				Key:       currentTask.key,
+				TaskIndex: currentTask.index,
+				ClientTag: ck.clientTag,
 			}
-			ck.mu.Unlock()
-			time.Sleep(time.Duration(10) * time.Millisecond)
+		} else {
+			// Put/Append task
+			args = &PutAppendArgs{
+				Key:       currentTask.key,
+				Value:     currentTask.value,
+				Op:        currentTask.op,
+				TaskIndex: currentTask.index,
+				ClientTag: ck.clientTag,
+			}
+		}
+		for {
+			if err, value := ck.startTask(currentTask.op, args); err != ErrNoLeader {
+				// 任务完成,Err不一定是OK,也可能是ErrNoKey
+				DPrintf("C[%v] success a task:[%v]\n", ck.clientTag, currentTask)
+				// 如果是Get会传回value,如果是Put/Append会传回"",让Append请求完成
+				currentTask.resultCh <- value
+				break
+			}
+			time.Sleep(clientNoLeaderSleepTime)
 		}
 	}
-	return "",false
-}
-
-func (ck *Clerk) sendCmdRpc(serverID int, rpcnum int, key string, value string, OpType OPType) {
-	args := &CmdArgs{
-		SeqId : ck.seqId,
-		ClientId : ck.clerkId,
-		Key : key,
-		Value : value,
-		OpType : OpType,
 	}
-	reply := &CmdReply{}
-	DPrintf("[clerk:%v]: send rpc to server:%v, args:%v\n", ck.clerkId, serverID, args)
-	ok := ck.servers[serverID].Call("KVServer.Command", args, reply)
-	
-	if ok {
-		ck.mu.Lock()
-		defer ck.mu.Unlock()
-		DPrintf("[clerk:%v]: get rpc from server:%v, reply:%v", ck.clerkId, reply.ServerId, reply)
-		
-		//通过rpcnum确定该reply是否是本次rpc请求的回复
-		if rpcnum == ck.rpcnum{
-			if reply.Err == OK{
-				if OpType == OpGet{
-					ck.rpcstate = RPCWithRes
-					ck.rpcres = reply.Value
-				}else {
-					ck.rpcstate = RPCNoRes
+
+// 并行的向所有Servers发送某个Task
+func (ck *Clerk) startTask(op string, args interface{}) (Err, string) {
+	// 所有的Reply发送到该Ch
+	replyCh := make(chan interface{}, len(ck.servers))
+	// 当前Reply的Server
+	serverCh := make(chan int, len(ck.servers))
+	// 初始化Reply
+	replies := make([]interface{}, len(ck.servers))
+	for index := range replies {
+		if op == "Get" {
+			replies[index] = &GetReply{}
+		} else {
+			replies[index] = &PutAppendReply{}
+		}
+	}
+	// 向某个Server提交Task
+	askServer := func(server int) {
+		if op == "Get" {
+			ck.servers[server].Call("KVServer.Get", args, replies[server])
+		} else {
+			ck.servers[server].Call("KVServer.PutAppend", args, replies[server])
+		}
+		replyCh <- replies[server]
+		serverCh <- server
+	}
+	// 会收到的Reply的数量
+	replyCount := len(ck.servers)
+	if ck.leaderIndex != -1 {
+		// 优先发给上一次保存的Leader
+		go askServer(ck.leaderIndex)
+		replyCount = 1
+	} else {
+		// 没有保存leaderIndex,从所有服务器拿结果
+		for server := 0; server < len(ck.servers); server++ {
+			go askServer(server)
+		}
+	}
+	// 持续检查replyCh,如果有可用的reply则直接返回
+	timeOut := time.After(clientDoTaskTimeOut)
+	for ; replyCount > 0; replyCount-- {
+		var reply interface{}
+		select {
+		case reply = <-replyCh:
+			// 拿到了reply
+		case <-timeOut:
+			// 任务超时
+			DPrintf("C[%v] task[%v] timeout,leaderIndex[%v]\n", ck.clientTag, args, ck.leaderIndex)
+			ck.leaderIndex = -1
+			return ErrNoLeader, ""
+		}
+		server := <-serverCh
+		// 如果Reply不为空则返回对应的数据给ch
+		if op == "Get" && reply != nil {
+			// Get
+			getReply := reply.(*GetReply)
+			if getReply.Err == OK || getReply.Err == ErrNoKey {
+				ck.leaderIndex = server
+				return getReply.Err, getReply.Value
 				}
-			}else if reply.Err == ErrNoKey{
-				ck.rpcstate = RPCNoRes
-			}else{
-				ck.rpcstate = RPCWrong
+		} else if reply != nil {
+			// Put/Append
+			putAppendReply := reply.(*PutAppendReply)
+			if putAppendReply.Err == OK {
+				ck.leaderIndex = server
+				return putAppendReply.Err, ""
 			}
 		}
 	}
+// 没有可用的Leader或是保存的leaderIndex失效
+	ck.leaderIndex = -1
+	return ErrNoLeader, ""
 }
 
-func (ck *Clerk) sendGet(key string) string{
-	var result string
-	var ok bool
-	//使用loop不断重试command，直到返回预期结果
-	for{
- 		result, ok = ck.sendCmd(key, "", OpGet)
-		if ok{
-			break;
-		}
+// 添加任务,返回任务结果的chan
+func (ck *Clerk) addTask(op string, key string, value string) chan string {
+	resultCh := make(chan string)
+	ck.taskMu.Lock()
+	ck.taskQueue <- task{
+		index:    ck.taskIndex + 1,
+		op:       op,
+		key:      key,
+		value:    value,
+		resultCh: resultCh,
 	}
-	return result
-}
-
-func (ck *Clerk) sendPut(key string, value string){
-	var ok bool
-	for{
-		_, ok = ck.sendCmd(key, value, OpPut)
-		if ok{
-			break;
-		}
-	}
-}
-
-func (ck *Clerk) sendAppend(key string, value string){
-	var ok bool
-	for{
-		_, ok = ck.sendCmd(key, value, OpAppend)
-		if ok{
-			break
-		}
-	}
+	ck.taskIndex++
+	ck.taskMu.Unlock()
+	return resultCh
 }
 
 func (ck *Clerk) Get(key string) string {
-	DPrintf("[clerk:%v]: receive OPGET\n", ck.clerkId)
-    return ck.sendGet(key)
+return <-ck.addTask("Get", key, "")
+}
+
+func (ck *Clerk) PutAppend(key string, value string, op string) {
+	<-ck.addTask(op, key, value)
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	DPrintf("[clerk:%v]: receive OPPUT\n", ck.clerkId)
-    ck.sendPut(key, value)
+	ck.PutAppend(key, value, "Put")
 }
-
 func (ck *Clerk) Append(key string, value string) {
-	DPrintf("[clerk:%v]: receive OPAPPEND\n", ck.clerkId)
-    ck.sendAppend(key, value)
+	ck.PutAppend(key, value, "Append")
 }
