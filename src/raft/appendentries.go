@@ -205,13 +205,13 @@ func (rf *Raft) pocessAppendReplyL(serverId int, args *AppendEntriesArgs, reply 
 			}
 			//如果待发送给follower的日志索引小于当前日志的Index0，则发送快照，并更新nextIndex[]
 			if rf.nextIndex[serverId] < rf.log.Index0{
-				go rf.sendSnap(serverId)
+				rf.sendSnapL(serverId)
 				rf.nextIndex[serverId] = rf.log.Index0
 			}
 		}else if rf.nextIndex[serverId] > 1 {
 			rf.nextIndex[serverId]--
 			if rf.nextIndex[serverId] < rf.log.Index0{
-				go rf.sendSnap(serverId)
+			    rf.sendSnapL(serverId)
 				rf.nextIndex[serverId] = rf.log.Index0
 			}
 		}

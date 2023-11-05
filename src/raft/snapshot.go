@@ -39,16 +39,19 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.applyCond.Broadcast() 
 }
 
-func (rf *Raft) sendSnap(peer int){
-	reply := InstallSnapshotReply{}
+func (rf *Raft) sendSnapL(peer int){
 	args := &InstallSnapshotArgs{rf.currentTerm, rf.me, rf.lastsnapshotIndex, rf.lastsnapshotTerm, make([]byte, len(rf.snapshot))}
 	copy(args.Data, rf.snapshot)
-	ok := rf.sendSnapshot(peer, args, &reply)
-	if ok{
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		rf.pocessSnapshotReplyL(peer, args, &reply)
-	}
+
+	go func(){
+		reply := InstallSnapshotReply{}
+		ok := rf.sendSnapshot(peer, args, &reply)
+		if ok{
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			rf.pocessSnapshotReplyL(peer, args, &reply)
+		}
+	}()
 }
 
 func (rf *Raft) sendSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
